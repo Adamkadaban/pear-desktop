@@ -1,0 +1,361 @@
+import { LoggerPrefix } from '@/utils';
+
+import type { serve as serveType } from '@hono/node-server';
+// Type-only; the value is dynamically imported to keep this module
+// side-effect-free (so the renderer build never pulls electron/node deps).
+import type {
+  Innertube,
+  YT,
+} from '\u0079\u006f\u0075\u0074\u0075\u0062\u0065i.js';
+
+interface ResolvedStream {
+  bytes: Uint8Array;
+  contentType: string;
+  expiresAt: number;
+}
+
+interface DownloadAttempt {
+  // youtubei FormatOptions; `any` avoids importing the value-side types here.
+  opts: { type: string; quality: string; format: string };
+  // Whether the resulting audio is AAC (so ffmpeg can stream-copy it into
+  // ADTS losslessly) or must be re-encoded to AAC (e.g. Opus/WebM).
+  aac: boolean;
+}
+
+/**
+ * Local HTTP server that the Cast device fetches audio from.
+ *
+ * YouTube's high-quality audio-only formats (itag 140 AAC, 251 Opus, ...) are
+ * delivered as *fragmented* (DASH) MP4/WebM, which the Chromecast Default Media
+ * Receiver's progressive player cannot play (it errors with idleReason=ERROR).
+ * Muxed formats are progressive but low quality and waste video bandwidth.
+ *
+ * So we download the best audio on this machine (via youtubei.js, which handles
+ * the segmented/range fetching and any deciphering through the Electron `net`
+ * fetch) and **remux** it — without re-encoding where possible — into a
+ * progressive ADTS/AAC stream using the bundled ffmpeg.wasm. The result is
+ * cached in memory and served to the speaker with full HTTP Range support.
+ *
+ * Every node/electron dependency is imported lazily so this module stays
+ * side-effect-free and never reaches (or crashes) the renderer bundle.
+ */
+export class AudioProxy {
+  private yt: Innertube | null = null;
+  private server: ReturnType<typeof serveType> | null = null;
+  private port = 26539;
+  private lanIpAddr = '127.0.0.1';
+  private readonly cache = new Map<string, ResolvedStream>();
+  private readonly inflight = new Map<string, Promise<ResolvedStream>>();
+
+  // Lazily-created bundled ffmpeg.wasm instance + a mutex to serialise runs
+  // (ffmpeg.wasm has a single shared FS, so concurrent runs would collide).
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private ffmpeg: any = null;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private ffmpegLock: Promise<unknown> = Promise.resolve();
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private streamToIterable: ((s: any) => AsyncIterable<Uint8Array>) | null =
+    null;
+  private randomName: (() => string) | null = null;
+
+  async start(port: number) {
+    this.port = port;
+
+    const [yti, honoMod, honoCors, nodeServer, utilsMain, os, ytjs, nodeCrypto] =
+      await Promise.all([
+        import('\u0079\u006f\u0075\u0074\u0075\u0062\u0065i.js'),
+        import('hono'),
+        import('hono/cors'),
+        import('@hono/node-server'),
+        import('@/plugins/utils/main'),
+        import('node:os'),
+        import('\u0079\u006f\u0075\u0074\u0075\u0062\u0065i.js'),
+        import('node:crypto'),
+      ]);
+
+    const upstreamFetch = utilsMain.getNetFetchAsFetch();
+    this.lanIpAddr = computeLanIp(os.networkInterfaces());
+    this.yt = await yti.Innertube.create({
+      fetch: upstreamFetch,
+      generate_session_locally: true,
+    });
+    this.streamToIterable = ytjs.Utils.streamToIterable;
+    this.randomName = () => nodeCrypto.randomBytes(16).toString('hex');
+
+    const app = new honoMod.Hono();
+    app.use('*', honoCors.cors());
+    app.get('/audio/:videoId', (c) =>
+      this.handleAudio(c.req.raw, c.req.param('videoId')),
+    );
+
+    this.server = nodeServer.serve({
+      fetch: app.fetch.bind(app),
+      port: this.port,
+      hostname: '0.0.0.0',
+    });
+    console.log(
+      LoggerPrefix,
+      `[chromecast] audio proxy on http://${this.lanIpAddr}:${this.port}`,
+    );
+  }
+
+  stop() {
+    this.server?.close();
+    this.server = null;
+    this.cache.clear();
+    this.inflight.clear();
+  }
+
+  /** The URL to hand the Cast device for a given video. */
+  mediaUrl(videoId: string): string {
+    return `http://${this.lanIpAddr}:${this.port}/audio/${videoId}`;
+  }
+
+  /**
+   * Resolve (download + remux + cache) and return the content type for the
+   * LOAD command. The controller awaits this before issuing LOAD, so by the
+   * time the device fetches `/audio/:videoId` the bytes are already cached.
+   */
+  async contentType(videoId: string): Promise<string> {
+    return (await this.resolve(videoId)).contentType;
+  }
+
+  /** Pre-resolve a track without blocking (used to warm the next song). */
+  prefetch(videoId: string) {
+    this.resolve(videoId).catch(() => {
+      /* best-effort */
+    });
+  }
+
+  private async resolve(videoId: string): Promise<ResolvedStream> {
+    const cached = this.cache.get(videoId);
+    if (cached && cached.expiresAt > Date.now()) return cached;
+
+    const existing = this.inflight.get(videoId);
+    if (existing) return existing;
+
+    const job = this.doResolve(videoId).finally(() =>
+      this.inflight.delete(videoId),
+    );
+    this.inflight.set(videoId, job);
+    return job;
+  }
+
+  private async doResolve(videoId: string): Promise<ResolvedStream> {
+    const yt = this.yt;
+    if (!yt) throw new Error('Innertube not ready');
+
+    // IOS/ANDROID return directly-playable URLs without a po_token; WEB needs
+    // deciphering (handled by youtubei.js). Try them in order of preference.
+    const clients: ('IOS' | 'ANDROID' | undefined)[] = [
+      'IOS',
+      'ANDROID',
+      undefined,
+    ];
+    // Prefer AAC audio-only (lossless copy → ADTS); then any audio-only
+    // (re-encode Opus → AAC); finally muxed progressive (extract AAC).
+    const attempts: DownloadAttempt[] = [
+      { opts: { type: 'audio', quality: 'best', format: 'mp4' }, aac: true },
+      { opts: { type: 'audio', quality: 'best', format: 'any' }, aac: false },
+      {
+        opts: { type: 'video+audio', quality: 'best', format: 'any' },
+        aac: true,
+      },
+    ];
+
+    let lastErr: unknown = null;
+    for (const client of clients) {
+      let info: YT.VideoInfo;
+      try {
+        info = client
+          ? await yt.getInfo(videoId, { client })
+          : await yt.getInfo(videoId);
+      } catch (err) {
+        lastErr = err;
+        continue;
+      }
+
+      for (const attempt of attempts) {
+        try {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const stream = await info.download(attempt.opts as any);
+          const input = await this.collect(stream);
+          const bytes = await this.remux(input, attempt.aac);
+          if (!bytes.length) throw new Error('empty remux output');
+
+          const resolved: ResolvedStream = {
+            bytes,
+            contentType: 'audio/aac',
+            expiresAt: Date.now() + 60 * 60 * 1000,
+          };
+          this.put(videoId, resolved);
+          return resolved;
+        } catch (err) {
+          lastErr = err;
+          /* try the next attempt / client */
+        }
+      }
+    }
+    throw new Error(
+      `No playable format for ${videoId}: ${String(
+        (lastErr as Error)?.message ?? lastErr,
+      )}`,
+    );
+  }
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private async collect(stream: any): Promise<Uint8Array> {
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    const iterable = this.streamToIterable!(stream);
+    for await (const chunk of iterable) {
+      chunks.push(chunk);
+      total += chunk.length;
+    }
+    const out = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) {
+      out.set(chunk, offset);
+      offset += chunk.length;
+    }
+    return out;
+  }
+
+  /** Remux to progressive ADTS/AAC via bundled ffmpeg.wasm (serialised). */
+  private async remux(input: Uint8Array, aac: boolean): Promise<Uint8Array> {
+    const ff = await this.ensureFfmpeg();
+
+    // Serialise ffmpeg.wasm runs (shared in-memory FS).
+    const run = this.ffmpegLock.then(async () => {
+      const inName = this.randomName!();
+      const outName = `${inName}.aac`;
+      ff.FS('writeFile', inName, input);
+      try {
+        const args = aac
+          ? ['-i', inName, '-vn', '-acodec', 'copy', '-f', 'adts', outName]
+          : // eslint-disable-next-line prettier/prettier
+            ['-i', inName, '-vn', '-acodec', 'aac', '-b:a', '192k', '-f', 'adts', outName];
+        try {
+          await ff.run(...args);
+        } catch {
+          // Copy failed (codec mismatch) — fall back to an AAC re-encode.
+          try {
+            ff.FS('unlink', outName);
+          } catch {
+            /* not created */
+          }
+          await ff.run(
+            '-i',
+            inName,
+            '-vn',
+            '-acodec',
+            'aac',
+            '-b:a',
+            '192k',
+            '-f',
+            'adts',
+            outName,
+          );
+        }
+        return ff.FS('readFile', outName) as Uint8Array;
+      } finally {
+        try {
+          ff.FS('unlink', inName);
+        } catch {
+          /* ignore */
+        }
+        try {
+          ff.FS('unlink', outName);
+        } catch {
+          /* ignore */
+        }
+      }
+    });
+    this.ffmpegLock = run.catch(() => {});
+    return run;
+  }
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private async ensureFfmpeg(): Promise<any> {
+    if (this.ffmpeg?.isLoaded?.()) return this.ffmpeg;
+    if (!this.ffmpeg) {
+      const mod = await import('@ffmpeg.wasm/main');
+      this.ffmpeg = mod.createFFmpeg({
+        log: false,
+        logger() {},
+        progress() {},
+      });
+    }
+    if (!this.ffmpeg.isLoaded()) await this.ffmpeg.load();
+    return this.ffmpeg;
+  }
+
+  private put(videoId: string, resolved: ResolvedStream) {
+    this.cache.set(videoId, resolved);
+    // Bound memory: keep only the most-recent few remuxed tracks.
+    while (this.cache.size > 4) {
+      const oldest = this.cache.keys().next().value;
+      if (oldest === undefined) break;
+      this.cache.delete(oldest);
+    }
+  }
+
+  private async handleAudio(req: Request, videoId: string): Promise<Response> {
+    try {
+      const { bytes, contentType } = await this.resolve(videoId);
+      const total = bytes.length;
+      const range = req.headers.get('range');
+
+      if (range) {
+        const match = /bytes=(\d+)-(\d*)/.exec(range);
+        const start = match ? Number.parseInt(match[1], 10) : 0;
+        const end =
+          match && match[2]
+            ? Math.min(Number.parseInt(match[2], 10), total - 1)
+            : total - 1;
+        if (start >= total || start > end) {
+          return new Response('Range Not Satisfiable', {
+            status: 416,
+            headers: { 'Content-Range': `bytes */${total}` },
+          });
+        }
+        const chunk = bytes.subarray(start, end + 1);
+        return new Response(chunk as unknown as BodyInit, {
+          status: 206,
+          headers: {
+            'Content-Type': contentType,
+            'Accept-Ranges': 'bytes',
+            'Content-Range': `bytes ${start}-${end}/${total}`,
+            'Content-Length': String(chunk.length),
+          },
+        });
+      }
+
+      return new Response(bytes as unknown as BodyInit, {
+        status: 200,
+        headers: {
+          'Content-Type': contentType,
+          'Accept-Ranges': 'bytes',
+          'Content-Length': String(total),
+        },
+      });
+    } catch (err) {
+      console.error(LoggerPrefix, '[chromecast] proxy error', err);
+      return new Response('Failed to resolve stream', { status: 502 });
+    }
+  }
+}
+
+function computeLanIp(
+  interfaces: Record<
+    string,
+    { family: string; internal: boolean; address: string }[] | undefined
+  >,
+): string {
+  for (const addrs of Object.values(interfaces)) {
+    for (const addr of addrs ?? []) {
+      if (addr.family === 'IPv4' && !addr.internal) return addr.address;
+    }
+  }
+  return '127.0.0.1';
+}

@@ -1,0 +1,276 @@
+import { LoggerPrefix } from '@/utils';
+
+import { AudioProxy } from './proxy';
+import { CastDiscovery } from './discovery';
+import { CastSession } from './session';
+
+import type { SongInfo } from '@/providers/song-info';
+import type { CastDevice, ChromecastPluginConfig } from '../types';
+
+type SongChange = 'src' | 'play-or-paused' | 'time';
+
+/**
+ * Singleton orchestrator. Owns discovery, the active cast session, and the
+ * audio proxy, and mirrors the local YouTube Music player state to the
+ * connected speaker. Local audio muting is handled in the renderer (via the
+ * <video> element) so it never persists to YTM's stored volume.
+ */
+class CastController {
+  private readonly discovery = new CastDiscovery();
+  private readonly proxy = new AudioProxy();
+  private session: CastSession | null = null;
+
+  private config: ChromecastPluginConfig | null = null;
+  private setConfig: ((c: Partial<ChromecastPluginConfig>) => void) | null =
+    null;
+
+  private currentSong: SongInfo | null = null;
+  private lastCastVideoId: string | null = null;
+
+  // Seek detection: track the last observed elapsed time and the wall-clock
+  // moment we saw it. A jump away from the expected (~real-time) progression
+  // means the user scrubbed locally, which we mirror to the speaker.
+  private lastElapsed = 0;
+  private lastTimeAt = 0;
+
+  // While YouTube Music shows an ad on the LOCAL player we must not mirror it
+  // to the speaker (we never want ads on the Home, and the speaker should keep
+  // playing the real song). The renderer detects ads, fast-skips them, and
+  // pushes the state here.
+  private adShowing = false;
+
+  private onDevicesChanged?: (devices: CastDevice[]) => void;
+  private onStateChanged?: (activeId: string | null) => void;
+
+  async start(
+    config: ChromecastPluginConfig,
+    setConfig: (c: Partial<ChromecastPluginConfig>) => void,
+  ) {
+    this.config = config;
+    this.setConfig = setConfig;
+
+    // Imported lazily so the module stays side-effect-free at import time.
+    // (`@/providers/song-info` transitively pulls `@/config`/electron-store,
+    // which must never reach the renderer bundle via the shared index.ts.)
+    const { registerCallback, SongInfoEvent } = await import(
+      '@/providers/song-info'
+    );
+
+    await this.proxy.start(config.serverPort);
+    this.discovery.start((devices) => this.onDevicesChanged?.(devices));
+
+    registerCallback((info, event) => {
+      const change: SongChange =
+        event === SongInfoEvent.VideoSrcChanged
+          ? 'src'
+          : event === SongInfoEvent.PlayOrPaused
+            ? 'play-or-paused'
+            : 'time';
+      this.onSongEvent(info, change).catch(console.error);
+    });
+
+    if (config.autoConnect && config.lastDeviceId) {
+      // Give discovery a moment to populate before reconnecting.
+      setTimeout(() => {
+        const device = this.discovery.get(config.lastDeviceId!);
+        if (device) this.connectTo(device.id).catch(console.error);
+      }, 3000);
+    }
+  }
+
+  stop() {
+    this.disconnect();
+    this.discovery.stop();
+    this.proxy.stop();
+  }
+
+  // --- device registry -----------------------------------------------------
+
+  listDevices(): CastDevice[] {
+    return this.discovery.list();
+  }
+
+  refreshDevices() {
+    this.discovery.refresh();
+  }
+
+  onDevices(cb: (devices: CastDevice[]) => void) {
+    this.onDevicesChanged = cb;
+  }
+
+  /** Subscribe to connect/disconnect transitions (passes the active id or null). */
+  onState(cb: (activeId: string | null) => void) {
+    this.onStateChanged = cb;
+  }
+
+  private emitState() {
+    this.onStateChanged?.(this.activeDeviceId);
+  }
+
+  get activeDeviceId(): string | null {
+    return this.session?.device.id ?? null;
+  }
+
+  // --- session lifecycle ---------------------------------------------------
+
+  async connectTo(deviceId: string) {
+    const device = this.discovery.get(deviceId);
+    if (!device) {
+      console.warn(LoggerPrefix, `[chromecast] unknown device ${deviceId}`);
+      return;
+    }
+    this.disconnect();
+
+    const session = new CastSession(device, {
+      onClosed: (err) => {
+        if (err)
+          console.error(LoggerPrefix, '[chromecast] session closed', err);
+        if (this.session === session) this.handleDisconnected();
+      },
+    });
+    this.session = session;
+
+    try {
+      await session.connect();
+      session.setVolume(this.config?.castVolume ?? 0.4);
+      this.setConfig?.({ lastDeviceId: device.id });
+      console.log(LoggerPrefix, `[chromecast] connected to ${device.name}`);
+      this.emitState();
+      // Reset so the same track re-casts even if it was cast in a prior session.
+      this.lastCastVideoId = null;
+      await this.castCurrentSong();
+    } catch (err) {
+      console.error(LoggerPrefix, '[chromecast] connect failed', err);
+      this.handleDisconnected();
+    }
+  }
+
+  disconnect() {
+    if (!this.session) return;
+    this.session.disconnect();
+    this.session = null;
+    this.handleDisconnected();
+  }
+
+  private handleDisconnected() {
+    this.session = null;
+    this.lastCastVideoId = null;
+    this.emitState();
+  }
+
+  // --- playback mirroring --------------------------------------------------
+
+  private async onSongEvent(info: SongInfo, event: SongChange) {
+    this.currentSong = info;
+    if (!this.session?.isConnected) return;
+    // While an ad is on the LOCAL player, don't mirror anything to the speaker:
+    // the Home should keep playing the real song, and we never cast ads.
+    if (this.adShowing) return;
+
+    switch (event) {
+      case 'src':
+        this.resetSeekBaseline(info);
+        await this.castCurrentSong();
+        break;
+      case 'play-or-paused':
+        this.resetSeekBaseline(info);
+        if (info.isPaused) this.session.pause();
+        else this.session.play();
+        break;
+      case 'time':
+        this.maybeMirrorSeek(info);
+        break;
+      default:
+        break;
+    }
+  }
+
+  /** Reset the seek-detection baseline (call on src/play/pause transitions). */
+  private resetSeekBaseline(info: SongInfo) {
+    this.lastElapsed = info.elapsedSeconds ?? 0;
+    this.lastTimeAt = Date.now();
+  }
+
+  /**
+   * Detect a local scrub by comparing the reported elapsed time against the
+   * value we'd expect from real-time progression. A large discontinuity means
+   * the user dragged the progress bar — mirror it to the speaker.
+   */
+  private maybeMirrorSeek(info: SongInfo) {
+    const elapsed = info.elapsedSeconds ?? 0;
+    const now = Date.now();
+
+    if (this.lastTimeAt !== 0 && !info.isPaused) {
+      const expected = this.lastElapsed + (now - this.lastTimeAt) / 1000;
+      // TimeChanged fires on whole-second boundaries, so allow generous slack
+      // to avoid false positives; only real scrubs jump by >3s.
+      if (Math.abs(elapsed - expected) > 3) {
+        this.session?.seek(elapsed);
+      }
+    }
+
+    this.lastElapsed = elapsed;
+    this.lastTimeAt = now;
+  }
+
+  /**
+   * Called from the renderer when YouTube Music shows/hides an ad on the local
+   * player. While an ad shows we suppress mirroring; when it clears we refresh
+   * the baseline so the next time tick isn't mistaken for a seek.
+   */
+  setAdShowing(showing: boolean) {
+    if (this.adShowing === showing) return;
+    this.adShowing = showing;
+    if (!showing && this.currentSong) this.resetSeekBaseline(this.currentSong);
+  }
+
+
+  private async castCurrentSong() {
+    const info = this.currentSong;
+    if (!info?.videoId || !this.session?.isConnected) return;
+    if (info.videoId === this.lastCastVideoId) return;
+    this.lastCastVideoId = info.videoId;
+
+    try {
+      const contentType = await this.proxy.contentType(info.videoId);
+      await this.session.load(
+        {
+          contentId: this.proxy.mediaUrl(info.videoId),
+          contentType,
+          streamType: 'BUFFERED',
+          duration: info.songDuration || undefined,
+          metadata: {
+            type: 0,
+            metadataType: 3, // MusicTrackMediaMetadata
+            title: info.title,
+            artist: info.artist,
+            albumName: info.album ?? undefined,
+            images: info.imageSrc ? [{ url: info.imageSrc }] : undefined,
+          },
+        },
+        info.elapsedSeconds ?? 0,
+        !info.isPaused,
+      );
+    } catch (err) {
+      console.error(LoggerPrefix, '[chromecast] cast load failed', err);
+      this.lastCastVideoId = null;
+    }
+  }
+
+  updateConfig(config: ChromecastPluginConfig) {
+    this.config = config;
+  }
+
+  /** Set the connected speaker's volume (0..1) — driven by the YTM slider. */
+  setDeviceVolume(level: number) {
+    this.session?.setVolume(level);
+  }
+}
+
+// Lazily instantiated so this module stays side-effect-free at import time.
+// That lets the renderer build tree-shake the entire backend chain (which
+// imports `electron`) once the plugin loader strips the `backend`/`menu`
+// properties from index.ts.
+let controllerInstance: CastController | null = null;
+export const getCastController = (): CastController =>
+  (controllerInstance ??= new CastController());
