@@ -47,7 +47,10 @@ declare module 'castv2-client' {
   }
 
   export class Client extends EventEmitter {
-    connect(host: string | { host: string; port?: number }, callback: () => void): void;
+    connect(
+      host: string | { host: string; port?: number },
+      callback: () => void,
+    ): void;
     close(): void;
     launch<T>(
       receiver: { APP_ID?: string } | typeof DefaultMediaReceiver,

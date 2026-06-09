@@ -6,7 +6,29 @@ import type { serve as serveType } from '@hono/node-server';
 import type {
   Innertube,
   YT,
+  Utils as YtUtils,
+  Types as YtTypes,
 } from '\u0079\u006f\u0075\u0074\u0075\u0062\u0065i.js';
+
+/**
+ * Minimal shape of the bundled ffmpeg.wasm instance we use. The package ships
+ * no type definitions, so we declare just the methods we call here (rather than
+ * leaking `any` and disabling the no-unsafe-* lint rules everywhere).
+ */
+interface FfmpegInstance {
+  isLoaded(): boolean;
+  load(): Promise<void>;
+  run(...args: string[]): Promise<void>;
+  FS(method: 'writeFile', path: string, data: Uint8Array): void;
+  FS(method: 'readFile', path: string): Uint8Array;
+  FS(method: 'unlink', path: string): void;
+}
+
+type CreateFfmpeg = (opts: {
+  log: boolean;
+  logger: () => void;
+  progress: () => void;
+}) => FfmpegInstance;
 
 interface ResolvedStream {
   bytes: Uint8Array;
@@ -14,9 +36,10 @@ interface ResolvedStream {
   expiresAt: number;
 }
 
+const ONE_HOUR_MS = 60 * 60 * 1000;
+
 interface DownloadAttempt {
-  // youtubei FormatOptions; `any` avoids importing the value-side types here.
-  opts: { type: string; quality: string; format: string };
+  opts: YtTypes.DownloadOptions;
   // Whether the resulting audio is AAC (so ffmpeg can stream-copy it into
   // ADTS losslessly) or must be re-encoded to AAC (e.g. Opus/WebM).
   aac: boolean;
@@ -47,31 +70,35 @@ export class AudioProxy {
   private readonly cache = new Map<string, ResolvedStream>();
   private readonly inflight = new Map<string, Promise<ResolvedStream>>();
 
-  // Lazily-created bundled ffmpeg.wasm instance + a mutex to serialise runs
+  // Lazily-created bundled ffmpeg.wasm instance + a lock to serialise runs
   // (ffmpeg.wasm has a single shared FS, so concurrent runs would collide).
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  private ffmpeg: any = null;
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private ffmpeg: FfmpegInstance | null = null;
   private ffmpegLock: Promise<unknown> = Promise.resolve();
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  private streamToIterable: ((s: any) => AsyncIterable<Uint8Array>) | null =
-    null;
+  private streamToIterable: typeof YtUtils.streamToIterable | null = null;
   private randomName: (() => string) | null = null;
 
   async start(port: number) {
     this.port = port;
 
-    const [yti, honoMod, honoCors, nodeServer, utilsMain, os, ytjs, nodeCrypto] =
-      await Promise.all([
-        import('\u0079\u006f\u0075\u0074\u0075\u0062\u0065i.js'),
-        import('hono'),
-        import('hono/cors'),
-        import('@hono/node-server'),
-        import('@/plugins/utils/main'),
-        import('node:os'),
-        import('\u0079\u006f\u0075\u0074\u0075\u0062\u0065i.js'),
-        import('node:crypto'),
-      ]);
+    const [
+      yti,
+      honoMod,
+      honoCors,
+      nodeServer,
+      utilsMain,
+      os,
+      ytjs,
+      nodeCrypto,
+    ] = await Promise.all([
+      import('\u0079\u006f\u0075\u0074\u0075\u0062\u0065i.js'),
+      import('hono'),
+      import('hono/cors'),
+      import('@hono/node-server'),
+      import('@/plugins/utils/main'),
+      import('node:os'),
+      import('\u0079\u006f\u0075\u0074\u0075\u0062\u0065i.js'),
+      import('node:crypto'),
+    ]);
 
     const upstreamFetch = utilsMain.getNetFetchAsFetch();
     this.lanIpAddr = computeLanIp(os.networkInterfaces());
@@ -177,8 +204,7 @@ export class AudioProxy {
 
       for (const attempt of attempts) {
         try {
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          const stream = await info.download(attempt.opts as any);
+          const stream = await info.download(attempt.opts);
           const input = await this.collect(stream);
           const bytes = await this.remux(input, attempt.aac);
           if (!bytes.length) throw new Error('empty remux output');
@@ -186,7 +212,7 @@ export class AudioProxy {
           const resolved: ResolvedStream = {
             bytes,
             contentType: 'audio/aac',
-            expiresAt: Date.now() + 60 * 60 * 1000,
+            expiresAt: Date.now() + ONE_HOUR_MS,
           };
           this.put(videoId, resolved);
           return resolved;
@@ -203,8 +229,9 @@ export class AudioProxy {
     );
   }
 
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  private async collect(stream: any): Promise<Uint8Array> {
+  private async collect(
+    stream: ReadableStream<Uint8Array>,
+  ): Promise<Uint8Array> {
     const chunks: Uint8Array[] = [];
     let total = 0;
     const iterable = this.streamToIterable!(stream);
@@ -229,35 +256,32 @@ export class AudioProxy {
     const run = this.ffmpegLock.then(async () => {
       const inName = this.randomName!();
       const outName = `${inName}.aac`;
+      const copyArgs = ['-i', inName, '-vn', '-acodec', 'copy', '-f', 'adts'];
+      const encodeArgs = [
+        '-i',
+        inName,
+        '-vn',
+        '-acodec',
+        'aac',
+        '-b:a',
+        '192k',
+        '-f',
+        'adts',
+      ];
       ff.FS('writeFile', inName, input);
       try {
-        const args = aac
-          ? ['-i', inName, '-vn', '-acodec', 'copy', '-f', 'adts', outName]
-          : // eslint-disable-next-line prettier/prettier
-            ['-i', inName, '-vn', '-acodec', 'aac', '-b:a', '192k', '-f', 'adts', outName];
         try {
-          await ff.run(...args);
+          await ff.run(...(aac ? copyArgs : encodeArgs), outName);
         } catch {
-          // Copy failed (codec mismatch) — fall back to an AAC re-encode.
+          // Stream-copy failed (codec mismatch) — fall back to an AAC encode.
           try {
             ff.FS('unlink', outName);
           } catch {
             /* not created */
           }
-          await ff.run(
-            '-i',
-            inName,
-            '-vn',
-            '-acodec',
-            'aac',
-            '-b:a',
-            '192k',
-            '-f',
-            'adts',
-            outName,
-          );
+          await ff.run(...encodeArgs, outName);
         }
-        return ff.FS('readFile', outName) as Uint8Array;
+        return ff.FS('readFile', outName);
       } finally {
         try {
           ff.FS('unlink', inName);
@@ -275,11 +299,12 @@ export class AudioProxy {
     return run;
   }
 
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  private async ensureFfmpeg(): Promise<any> {
-    if (this.ffmpeg?.isLoaded?.()) return this.ffmpeg;
+  private async ensureFfmpeg(): Promise<FfmpegInstance> {
+    if (this.ffmpeg?.isLoaded()) return this.ffmpeg;
     if (!this.ffmpeg) {
-      const mod = await import('@ffmpeg.wasm/main');
+      const mod = (await import('@ffmpeg.wasm/main')) as unknown as {
+        createFFmpeg: CreateFfmpeg;
+      };
       this.ffmpeg = mod.createFFmpeg({
         log: false,
         logger() {},

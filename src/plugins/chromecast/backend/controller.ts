@@ -228,7 +228,7 @@ class CastController {
     if (typeof remote !== 'number' || !Number.isFinite(remote)) return;
     if (!(this.config?.muteLocalWhenCasting ?? true)) return;
 
-    const localNow = this.lastElapsed + (Date.now() - this.lastTimeAt) / 1000;
+    const localNow = this.estimateLocalElapsed();
     if (localNow - remote > 1) {
       // Pre-set the seek baseline so the resulting local TimeChanged isn't
       // misread as a user scrub (which would bounce a seek back to the speaker).
@@ -270,10 +270,9 @@ class CastController {
    */
   private maybeMirrorSeek(info: SongInfo) {
     const elapsed = info.elapsedSeconds ?? 0;
-    const now = Date.now();
 
     if (this.lastTimeAt !== 0 && !info.isPaused) {
-      const expected = this.lastElapsed + (now - this.lastTimeAt) / 1000;
+      const expected = this.estimateLocalElapsed();
       // TimeChanged fires on whole-second boundaries, so allow generous slack
       // to avoid false positives; only real scrubs jump by >3s.
       if (Math.abs(elapsed - expected) > 3) {
@@ -282,7 +281,13 @@ class CastController {
     }
 
     this.lastElapsed = elapsed;
-    this.lastTimeAt = now;
+    this.lastTimeAt = Date.now();
+  }
+
+  /** Estimate where the local player is now from the last time-change baseline. */
+  private estimateLocalElapsed(): number {
+    const secondsSinceBaseline = (Date.now() - this.lastTimeAt) / 1000;
+    return this.lastElapsed + secondsSinceBaseline;
   }
 
   /**
@@ -295,7 +300,6 @@ class CastController {
     this.adShowing = showing;
     if (!showing && this.currentSong) this.resetSeekBaseline(this.currentSong);
   }
-
 
   private async castCurrentSong() {
     const info = this.currentSong;
