@@ -43,6 +43,10 @@ export const onBackendStart = async ({
   castController.onState((activeId) =>
     ipc.send('chromecast:state-changed', activeId),
   );
+  // One-shot request to align the local (muted) player to the speaker's clock.
+  castController.onSyncLocalTime((seconds) =>
+    ipc.send('chromecast:sync-local-time', seconds),
+  );
 
   await castController.start(config, (partial) => {
     Promise.resolve(setConfig(partial)).catch(console.error);

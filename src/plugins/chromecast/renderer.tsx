@@ -68,6 +68,21 @@ export const renderer = createRenderer<
       if (id) sendCastVolume(); // start the speaker at the slider's volume
     });
 
+    // Backend asks us to align the local (muted) player to the speaker's clock.
+    // Safe because local is silent while casting — keeps it from running ahead.
+    ipc.on('chromecast:sync-local-time', (seconds: number) => {
+      const video = document.querySelector('video');
+      if (
+        video &&
+        activeId() &&
+        (this.config?.muteLocalWhenCasting ?? true) &&
+        Number.isFinite(seconds) &&
+        Math.abs(video.currentTime - seconds) > 1
+      ) {
+        video.currentTime = seconds;
+      }
+    });
+
     // Re-apply mute whenever a track (re)starts — YTM resets the video element.
     const onPlay = () => applyLocalMute();
     document.addEventListener('play', onPlay, true);
@@ -159,6 +174,7 @@ export const renderer = createRenderer<
       document.removeEventListener('volumechange', onVolumeChange, true);
       ipc.removeAllListeners('chromecast:devices-changed');
       ipc.removeAllListeners('chromecast:state-changed');
+      ipc.removeAllListeners('chromecast:sync-local-time');
       const video = document.querySelector('video');
       if (video) video.muted = false;
       dispose();

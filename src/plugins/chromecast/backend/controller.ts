@@ -39,8 +39,14 @@ class CastController {
   // pushes the state here.
   private adShowing = false;
 
+  // After a LOAD we resync once: the speaker starts a beat later than the local
+  // (muted) player due to download/remux/buffer latency, so the local conductor
+  // would otherwise run ahead and clip the speaker at the track boundary.
+  private awaitingSync = false;
+
   private onDevicesChanged?: (devices: CastDevice[]) => void;
   private onStateChanged?: (activeId: string | null) => void;
+  private onSyncLocal?: (seconds: number) => void;
 
   async start(
     config: ChromecastPluginConfig,
@@ -103,6 +109,11 @@ class CastController {
     this.onStateChanged = cb;
   }
 
+  /** Subscribe to one-shot "seek the local player to N seconds" sync requests. */
+  onSyncLocalTime(cb: (seconds: number) => void) {
+    this.onSyncLocal = cb;
+  }
+
   private emitState() {
     this.onStateChanged?.(this.activeDeviceId);
   }
@@ -127,6 +138,7 @@ class CastController {
           console.error(LoggerPrefix, '[chromecast] session closed', err);
         if (this.session === session) this.handleDisconnected();
       },
+      onStatus: (status) => this.handleStatus(status),
     });
     this.session = session;
 
@@ -185,7 +197,32 @@ class CastController {
     }
   }
 
-  /** Reset the seek-detection baseline (call on src/play/pause transitions). */
+  /**
+   * One-shot resync: when the speaker first reports PLAYING after a load, if the
+   * local (muted) player has run ahead of it, pull the local clock back to the
+   * speaker's position. Because the local player is silent while casting, this
+   * seek is inaudible — it just keeps the conductor from clipping the speaker at
+   * the next track boundary. Only runs when local muting is on.
+   */
+  private handleStatus(status: { playerState?: string; currentTime?: number }) {
+    if (!this.awaitingSync) return;
+    if (status?.playerState !== 'PLAYING') return;
+    this.awaitingSync = false;
+
+    const remote = status.currentTime;
+    if (typeof remote !== 'number' || !Number.isFinite(remote)) return;
+    if (!(this.config?.muteLocalWhenCasting ?? true)) return;
+
+    const localNow = this.lastElapsed + (Date.now() - this.lastTimeAt) / 1000;
+    if (localNow - remote > 1) {
+      // Pre-set the seek baseline so the resulting local TimeChanged isn't
+      // misread as a user scrub (which would bounce a seek back to the speaker).
+      this.lastElapsed = remote;
+      this.lastTimeAt = Date.now();
+      this.onSyncLocal?.(remote);
+    }
+  }
+
   private resetSeekBaseline(info: SongInfo) {
     this.lastElapsed = info.elapsedSeconds ?? 0;
     this.lastTimeAt = Date.now();
@@ -251,6 +288,8 @@ class CastController {
         info.elapsedSeconds ?? 0,
         !info.isPaused,
       );
+      // Resync the local conductor to the speaker once it actually starts.
+      this.awaitingSync = true;
     } catch (err) {
       console.error(LoggerPrefix, '[chromecast] cast load failed', err);
       this.lastCastVideoId = null;
