@@ -3,6 +3,7 @@ import { LoggerPrefix } from '@/utils';
 import { AudioProxy } from './proxy';
 import { CastDiscovery } from './discovery';
 import { CastSession } from './session';
+import { expectedElapsed, isSeek } from './util';
 
 import type { SongInfo } from '@/providers/song-info';
 import type { CastDevice, ChromecastPluginConfig } from '../types';
@@ -272,10 +273,9 @@ class CastController {
     const elapsed = info.elapsedSeconds ?? 0;
 
     if (this.lastTimeAt !== 0 && !info.isPaused) {
-      const expected = this.estimateLocalElapsed();
-      // TimeChanged fires on whole-second boundaries, so allow generous slack
-      // to avoid false positives; only real scrubs jump by >3s.
-      if (Math.abs(elapsed - expected) > 3) {
+      // TimeChanged fires on whole-second boundaries, so the default 3s slack
+      // avoids false positives; only real scrubs jump further.
+      if (isSeek(this.lastElapsed, this.lastTimeAt, elapsed, Date.now())) {
         this.session?.seek(elapsed);
       }
     }
@@ -286,8 +286,7 @@ class CastController {
 
   /** Estimate where the local player is now from the last time-change baseline. */
   private estimateLocalElapsed(): number {
-    const secondsSinceBaseline = (Date.now() - this.lastTimeAt) / 1000;
-    return this.lastElapsed + secondsSinceBaseline;
+    return expectedElapsed(this.lastElapsed, this.lastTimeAt, Date.now());
   }
 
   /**

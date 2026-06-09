@@ -1,5 +1,7 @@
 import { LoggerPrefix } from '@/utils';
 
+import { computeLanIp, parseRange } from './util';
+
 import type { serve as serveType } from '@hono/node-server';
 // Type-only; the value is dynamically imported to keep this module
 // side-effect-free (so the renderer build never pulls electron/node deps).
@@ -329,15 +331,10 @@ export class AudioProxy {
     try {
       const { bytes, contentType } = await this.resolve(videoId);
       const total = bytes.length;
-      const range = req.headers.get('range');
+      const range = parseRange(req.headers.get('range'), total);
 
       if (range) {
-        const match = /bytes=(\d+)-(\d*)/.exec(range);
-        const start = match ? Number.parseInt(match[1], 10) : 0;
-        const end =
-          match && match[2]
-            ? Math.min(Number.parseInt(match[2], 10), total - 1)
-            : total - 1;
+        const { start, end } = range;
         if (start >= total || start > end) {
           return new Response('Range Not Satisfiable', {
             status: 416,
@@ -369,18 +366,4 @@ export class AudioProxy {
       return new Response('Failed to resolve stream', { status: 502 });
     }
   }
-}
-
-function computeLanIp(
-  interfaces: Record<
-    string,
-    { family: string; internal: boolean; address: string }[] | undefined
-  >,
-): string {
-  for (const addrs of Object.values(interfaces)) {
-    for (const addr of addrs ?? []) {
-      if (addr.family === 'IPv4' && !addr.internal) return addr.address;
-    }
-  }
-  return '127.0.0.1';
 }
