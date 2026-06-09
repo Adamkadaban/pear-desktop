@@ -40,7 +40,10 @@ export function parseRange(
   total: number,
 ): ByteRange | null {
   if (!rangeHeader) return null;
-  const match = /bytes=(\d+)-(\d*)/.exec(rangeHeader);
+  // Only a single byte-range is supported; reject multipart ranges such as
+  // "bytes=0-1,2-3" (the anchored regex won't match) so we fall back to a full
+  // 200 response instead of mis-serving the first sub-range as a 206.
+  const match = /^bytes=(\d+)-(\d*)$/.exec(rangeHeader.trim());
   if (!match) return null;
   const start = Number.parseInt(match[1], 10);
   const end = match[2]

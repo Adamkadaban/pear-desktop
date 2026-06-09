@@ -30,6 +30,11 @@ test('parseRange returns null without a (valid) Range header', () => {
   expect(parseRange('bytes=abc', 1000)).toBeNull();
 });
 
+test('parseRange rejects multipart ranges (single-range only)', () => {
+  expect(parseRange('bytes=0-1,2-3', 1000)).toBeNull();
+  expect(parseRange('bytes=0-99, 200-299', 1000)).toBeNull();
+});
+
 test('parseRange parses an explicit start-end range', () => {
   expect(parseRange('bytes=100-200', 1000)).toEqual({ start: 100, end: 200 });
 });

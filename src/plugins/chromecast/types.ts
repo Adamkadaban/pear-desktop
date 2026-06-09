@@ -21,7 +21,9 @@ export interface ChromecastPluginConfig {
    */
   muteLocalWhenCasting: boolean;
   /**
-   * Last Cast-device volume (0..1), restored on the next session.
+   * Initial Cast-device volume (0..1) applied when a session starts. The live
+   * YTM volume slider drives the speaker during a session but is not persisted
+   * back here.
    * @default 0.4
    */
   castVolume: number;

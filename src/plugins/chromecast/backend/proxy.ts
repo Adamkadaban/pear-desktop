@@ -115,11 +115,20 @@ export class AudioProxy {
       return this.handleAudio(c.req.raw, c.req.param('videoId'));
     });
 
-    this.server = nodeServer.serve({
-      fetch: app.fetch.bind(app),
-      port: this.port,
-      hostname: '0.0.0.0',
-    });
+    try {
+      this.server = nodeServer.serve({
+        fetch: app.fetch.bind(app),
+        port: this.port,
+        hostname: '0.0.0.0',
+      });
+    } catch (err) {
+      console.error(
+        LoggerPrefix,
+        `[chromecast] failed to start audio proxy on port ${this.port} (is it in use?)`,
+        err,
+      );
+      throw err;
+    }
     console.log(
       LoggerPrefix,
       `[chromecast] audio proxy on http://${this.lanIpAddr}:${this.port}`,
