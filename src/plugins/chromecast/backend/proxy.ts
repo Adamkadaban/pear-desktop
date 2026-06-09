@@ -2,13 +2,11 @@ import { LoggerPrefix } from '@/utils';
 
 import { computeLanIp, parseRange } from './util';
 
-import type { serve as serveType } from '@hono/node-server';
-// Type-only; the value is dynamically imported to keep this module
+// Type-only; the values are dynamically imported to keep this module
 // side-effect-free (so the renderer build never pulls electron/node deps).
 import type {
   Innertube,
   YT,
-  Utils as YtUtils,
   Types as YtTypes,
 } from '\u0079\u006f\u0075\u0074\u0075\u0062\u0065i.js';
 
@@ -66,7 +64,7 @@ interface DownloadAttempt {
  */
 export class AudioProxy {
   private yt: Innertube | null = null;
-  private server: ReturnType<typeof serveType> | null = null;
+  private server: { close: () => void } | null = null;
   private port = 26539;
   private lanIpAddr = '127.0.0.1';
   private readonly cache = new Map<string, ResolvedStream>();
@@ -76,7 +74,9 @@ export class AudioProxy {
   // (ffmpeg.wasm has a single shared FS, so concurrent runs would collide).
   private ffmpeg: FfmpegInstance | null = null;
   private ffmpegLock: Promise<unknown> = Promise.resolve();
-  private streamToIterable: typeof YtUtils.streamToIterable | null = null;
+  private streamToIterable:
+    | ((stream: ReadableStream<Uint8Array>) => AsyncIterable<Uint8Array>)
+    | null = null;
   private randomName: (() => string) | null = null;
   // Unguessable per-session token in the media URL path, so other devices on
   // the LAN can't hit the endpoint and trigger expensive download+remux work.

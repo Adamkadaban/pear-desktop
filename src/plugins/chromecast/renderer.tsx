@@ -53,7 +53,7 @@ export const renderer = createRenderer<
     // slider value to the speaker.
     const sendCastVolume = () => {
       const video = document.querySelector('video');
-      if (video) ipc.send('chromecast:set-volume', video.volume);
+      if (video) ipc.invoke('chromecast:set-volume', video.volume);
     };
     const onVolumeChange = () => {
       if (!activeId()) return;
@@ -117,7 +117,7 @@ export const renderer = createRenderer<
           player.classList.contains('ad-interrupting'));
       if (showing !== adShowing) {
         adShowing = showing;
-        ipc.send('chromecast:ad-state', showing);
+        ipc.invoke('chromecast:ad-state', showing);
       }
     };
     const moviePlayer = document.querySelector('#movie_player');

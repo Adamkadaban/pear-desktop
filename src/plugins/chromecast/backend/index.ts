@@ -25,14 +25,16 @@ export const onBackendStart = async ({
   ipc.handle('chromecast:disconnect', () => castController.disconnect());
   ipc.handle('chromecast:refresh', () => castController.refreshDevices());
 
-  // The YTM volume slider drives the speaker volume while casting.
-  ipc.on('chromecast:set-volume', (level: number) =>
+  // The YTM volume slider drives the speaker volume while casting. Modelled as
+  // `handle` (not `on`) so it can be removed on stop — the framework's `ipc.on`
+  // wraps the listener anonymously and exposes no way to unsubscribe.
+  ipc.handle('chromecast:set-volume', (level: number) =>
     castController.setDeviceVolume(level),
   );
 
   // The renderer tells us when an ad is on the local player so we can suppress
   // mirroring (belt-and-suspenders alongside the adblocker plugin).
-  ipc.on('chromecast:ad-state', (showing: boolean) =>
+  ipc.handle('chromecast:ad-state', (showing: boolean) =>
     castController.setAdShowing(showing),
   );
 
@@ -68,6 +70,8 @@ export const onBackendStop = ({
     'chromecast:connect',
     'chromecast:disconnect',
     'chromecast:refresh',
+    'chromecast:set-volume',
+    'chromecast:ad-state',
   ]) {
     ipc.removeHandler(channel);
   }

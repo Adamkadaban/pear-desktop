@@ -309,13 +309,20 @@ class CastController {
 
   private async castCurrentSong() {
     const info = this.currentSong;
-    if (!info?.videoId || !this.session?.isConnected) return;
+    const session = this.session;
+    if (!info?.videoId || !session?.isConnected) return;
     if (info.videoId === this.lastCastVideoId) return;
     this.lastCastVideoId = info.videoId;
 
     try {
       const contentType = await this.proxy.contentType(info.videoId);
-      await this.session.load(
+      // The user may have disconnected (or the session errored/changed) while
+      // we awaited the proxy; bail cleanly instead of dereferencing a stale one.
+      if (this.session !== session || !session.isConnected) {
+        this.lastCastVideoId = null;
+        return;
+      }
+      await session.load(
         {
           contentId: this.proxy.mediaUrl(info.videoId),
           contentType,
