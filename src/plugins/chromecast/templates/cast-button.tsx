@@ -24,6 +24,9 @@ export const CastButton = (props: CastButtonProps) => (
     classList={{ casting: props.casting }}
   >
     <button
+      aria-controls="chromecast-popup"
+      aria-expanded={props.open}
+      aria-haspopup="menu"
       aria-label={t('plugins.chromecast.name')}
       class="chromecast-button style-scope ytmusic-player-bar"
       on:click={(event) => props.onToggle(event)}
@@ -42,7 +45,7 @@ export const CastButton = (props: CastButtonProps) => (
     </button>
 
     <Show when={props.open}>
-      <div class="chromecast-popup">
+      <div class="chromecast-popup" id="chromecast-popup" role="menu">
         <div class="chromecast-popup-header">
           {t('plugins.chromecast.menu.devices')}
         </div>
@@ -60,6 +63,7 @@ export const CastButton = (props: CastButtonProps) => (
                 class="chromecast-device"
                 classList={{ active: device.id === props.activeId }}
                 on:click={() => props.onPick(device.id)}
+                role="menuitem"
               >
                 <span class="chromecast-device-name">{device.name}</span>
                 <Show when={device.model}>

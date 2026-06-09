@@ -68,9 +68,12 @@ export class CastDiscovery {
 
   private onService(service: Service) {
     const txt = (service.txt ?? {}) as Record<string, string>;
+    // Prefer an advertised IPv4 address; only fall back to the referer when it
+    // too is IPv4, so we never store an IPv6 host the Cast client can't use.
+    const referer = service.referer?.address;
     const host =
       (service.addresses ?? []).find((addr) => isIPv4(addr)) ??
-      service.referer?.address;
+      (referer && isIPv4(referer) ? referer : undefined);
     const id = this.idFor(service);
     if (!host || !id) return;
 
