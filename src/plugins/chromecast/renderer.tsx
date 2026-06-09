@@ -27,13 +27,23 @@ export const renderer = createRenderer<
 
     // Mute the local <video> while casting so audio only plays on the speaker.
     // Using the element's `muted` flag (not YTM's volume) keeps it from
-    // persisting to YTM's stored volume.
+    // persisting to YTM's stored volume. We capture the user's mute state when
+    // casting begins and restore it when casting ends, so we never clobber a
+    // pre-existing mute preference.
+    let preCastMuted: boolean | null = null;
     const applyLocalMute = () => {
       const video = document.querySelector('video');
       if (!video) return;
       const shouldMute =
         !!activeId() && (this.config?.muteLocalWhenCasting ?? true);
-      if (video.muted !== shouldMute) video.muted = shouldMute;
+      if (shouldMute) {
+        if (preCastMuted === null) preCastMuted = video.muted;
+        if (!video.muted) video.muted = true;
+      } else if (preCastMuted !== null) {
+        // Restore whatever the user had before we started muting.
+        video.muted = preCastMuted;
+        preCastMuted = null;
+      }
     };
     this.applyMute = applyLocalMute;
 
@@ -117,6 +127,7 @@ export const renderer = createRenderer<
         attributes: true,
         attributeFilter: ['class'],
       });
+      checkAdState(); // sync initial state (an ad may already be showing)
     }
 
     const onToggle = () => {
@@ -185,7 +196,8 @@ export const renderer = createRenderer<
       ipc.removeAllListeners('chromecast:sync-local-time');
       ipc.removeAllListeners('chromecast:remote-playback');
       const video = document.querySelector('video');
-      if (video) video.muted = false;
+      // Restore the user's pre-cast mute state (only if we changed it).
+      if (video && preCastMuted !== null) video.muted = preCastMuted;
       dispose();
       container.remove();
     };

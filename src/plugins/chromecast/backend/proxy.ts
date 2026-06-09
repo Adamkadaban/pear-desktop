@@ -78,29 +78,23 @@ export class AudioProxy {
   private ffmpegLock: Promise<unknown> = Promise.resolve();
   private streamToIterable: typeof YtUtils.streamToIterable | null = null;
   private randomName: (() => string) | null = null;
+  // Unguessable per-session token in the media URL path, so other devices on
+  // the LAN can't hit the endpoint and trigger expensive download+remux work.
+  private token = '';
 
   async start(port: number) {
     this.port = port;
 
-    const [
-      yti,
-      honoMod,
-      honoCors,
-      nodeServer,
-      utilsMain,
-      os,
-      ytjs,
-      nodeCrypto,
-    ] = await Promise.all([
-      import('\u0079\u006f\u0075\u0074\u0075\u0062\u0065i.js'),
-      import('hono'),
-      import('hono/cors'),
-      import('@hono/node-server'),
-      import('@/plugins/utils/main'),
-      import('node:os'),
-      import('\u0079\u006f\u0075\u0074\u0075\u0062\u0065i.js'),
-      import('node:crypto'),
-    ]);
+    const [yti, honoMod, nodeServer, utilsMain, os, ytjs, nodeCrypto] =
+      await Promise.all([
+        import('\u0079\u006f\u0075\u0074\u0075\u0062\u0065i.js'),
+        import('hono'),
+        import('@hono/node-server'),
+        import('@/plugins/utils/main'),
+        import('node:os'),
+        import('\u0079\u006f\u0075\u0074\u0075\u0062\u0065i.js'),
+        import('node:crypto'),
+      ]);
 
     const upstreamFetch = utilsMain.getNetFetchAsFetch();
     this.lanIpAddr = computeLanIp(os.networkInterfaces());
@@ -110,12 +104,17 @@ export class AudioProxy {
     });
     this.streamToIterable = ytjs.Utils.streamToIterable;
     this.randomName = () => nodeCrypto.randomBytes(16).toString('hex');
+    this.token = nodeCrypto.randomBytes(16).toString('hex');
 
+    // No CORS middleware: the consumer is the Cast receiver (not a browser),
+    // so we deliberately avoid advertising the endpoint to web origins.
     const app = new honoMod.Hono();
-    app.use('*', honoCors.cors());
-    app.get('/audio/:videoId', (c) =>
-      this.handleAudio(c.req.raw, c.req.param('videoId')),
-    );
+    app.get('/audio/:token/:videoId', (c) => {
+      if (c.req.param('token') !== this.token) {
+        return new Response('Not found', { status: 404 });
+      }
+      return this.handleAudio(c.req.raw, c.req.param('videoId'));
+    });
 
     this.server = nodeServer.serve({
       fetch: app.fetch.bind(app),
@@ -137,7 +136,7 @@ export class AudioProxy {
 
   /** The URL to hand the Cast device for a given video. */
   mediaUrl(videoId: string): string {
-    return `http://${this.lanIpAddr}:${this.port}/audio/${videoId}`;
+    return `http://${this.lanIpAddr}:${this.port}/audio/${this.token}/${videoId}`;
   }
 
   /**
@@ -158,7 +157,12 @@ export class AudioProxy {
 
   private async resolve(videoId: string): Promise<ResolvedStream> {
     const cached = this.cache.get(videoId);
-    if (cached && cached.expiresAt > Date.now()) return cached;
+    if (cached && cached.expiresAt > Date.now()) {
+      // Refresh recency so LRU eviction in put() reflects access, not insertion.
+      this.cache.delete(videoId);
+      this.cache.set(videoId, cached);
+      return cached;
+    }
 
     const existing = this.inflight.get(videoId);
     if (existing) return existing;

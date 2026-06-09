@@ -57,7 +57,20 @@ export const onBackendStart = async ({
   });
 };
 
-export const onBackendStop = () => {
+export const onBackendStop = ({
+  ipc,
+}: BackendContext<ChromecastPluginConfig>) => {
+  // Remove the invoke handlers so re-enabling the plugin in the same session
+  // doesn't throw on duplicate `ipcMain.handle` registration.
+  for (const channel of [
+    'chromecast:get-devices',
+    'chromecast:get-active',
+    'chromecast:connect',
+    'chromecast:disconnect',
+    'chromecast:refresh',
+  ]) {
+    ipc.removeHandler(channel);
+  }
   getCastController().stop();
 };
 
