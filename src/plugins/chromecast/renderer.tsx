@@ -17,7 +17,7 @@ export const renderer = createRenderer<
   },
   ChromecastPluginConfig
 >({
-  async onPlayerApiReady(_api, context) {
+  async onPlayerApiReady(api, context) {
     const { ipc } = context;
     this.config = await context.getConfig();
 
@@ -81,6 +81,14 @@ export const renderer = createRenderer<
       ) {
         video.currentTime = seconds;
       }
+    });
+
+    // Reflect external play/pause (e.g. the Google Home phone app paused the
+    // speaker) onto the local conductor so the two stay in lock-step.
+    ipc.on('chromecast:remote-playback', (action: 'play' | 'pause') => {
+      if (!activeId()) return;
+      if (action === 'pause') api.pauseVideo();
+      else api.playVideo();
     });
 
     // Re-apply mute whenever a track (re)starts — YTM resets the video element.
@@ -175,6 +183,7 @@ export const renderer = createRenderer<
       ipc.removeAllListeners('chromecast:devices-changed');
       ipc.removeAllListeners('chromecast:state-changed');
       ipc.removeAllListeners('chromecast:sync-local-time');
+      ipc.removeAllListeners('chromecast:remote-playback');
       const video = document.querySelector('video');
       if (video) video.muted = false;
       dispose();

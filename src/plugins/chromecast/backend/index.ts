@@ -47,6 +47,10 @@ export const onBackendStart = async ({
   castController.onSyncLocalTime((seconds) =>
     ipc.send('chromecast:sync-local-time', seconds),
   );
+  // External play/pause made on the speaker (e.g. the Google Home phone app).
+  castController.onRemotePlaybackChange((action) =>
+    ipc.send('chromecast:remote-playback', action),
+  );
 
   await castController.start(config, (partial) => {
     Promise.resolve(setConfig(partial)).catch(console.error);

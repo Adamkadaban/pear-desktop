@@ -44,9 +44,15 @@ class CastController {
   // would otherwise run ahead and clip the speaker at the track boundary.
   private awaitingSync = false;
 
+  // Last play/pause state reported by the speaker, so we can reflect *external*
+  // control (e.g. pausing from the Google Home app on a phone) back onto the
+  // local conductor — the reverse of our normal local -> speaker mirroring.
+  private lastRemotePlayerState: string | null = null;
+
   private onDevicesChanged?: (devices: CastDevice[]) => void;
   private onStateChanged?: (activeId: string | null) => void;
   private onSyncLocal?: (seconds: number) => void;
+  private onRemotePlayback?: (action: 'play' | 'pause') => void;
 
   async start(
     config: ChromecastPluginConfig,
@@ -114,6 +120,11 @@ class CastController {
     this.onSyncLocal = cb;
   }
 
+  /** Subscribe to external play/pause changes made on the speaker itself. */
+  onRemotePlaybackChange(cb: (action: 'play' | 'pause') => void) {
+    this.onRemotePlayback = cb;
+  }
+
   private emitState() {
     this.onStateChanged?.(this.activeDeviceId);
   }
@@ -150,6 +161,7 @@ class CastController {
       this.emitState();
       // Reset so the same track re-casts even if it was cast in a prior session.
       this.lastCastVideoId = null;
+      this.lastRemotePlayerState = null;
       await this.castCurrentSong();
     } catch (err) {
       console.error(LoggerPrefix, '[chromecast] connect failed', err);
@@ -167,6 +179,7 @@ class CastController {
   private handleDisconnected() {
     this.session = null;
     this.lastCastVideoId = null;
+    this.lastRemotePlayerState = null;
     this.emitState();
   }
 
@@ -205,6 +218,8 @@ class CastController {
    * the next track boundary. Only runs when local muting is on.
    */
   private handleStatus(status: { playerState?: string; currentTime?: number }) {
+    this.reconcileRemotePlayback(status);
+
     if (!this.awaitingSync) return;
     if (status?.playerState !== 'PLAYING') return;
     this.awaitingSync = false;
@@ -220,6 +235,26 @@ class CastController {
       this.lastElapsed = remote;
       this.lastTimeAt = Date.now();
       this.onSyncLocal?.(remote);
+    }
+  }
+
+  /**
+   * Reflect *external* play/pause control (e.g. from the Google Home app on a
+   * phone) back onto the local conductor. Edge-triggered on the speaker's
+   * playerState and only acts when it disagrees with the local state, so our
+   * own local -> speaker mirroring can't create a feedback loop (the local op
+   * leaves both sides in agreement, so the resulting status is a no-op).
+   */
+  private reconcileRemotePlayback(status: { playerState?: string }) {
+    const ps = status?.playerState;
+    if (ps !== 'PLAYING' && ps !== 'PAUSED') return;
+    if (ps === this.lastRemotePlayerState) return;
+    this.lastRemotePlayerState = ps;
+
+    const remotePaused = ps === 'PAUSED';
+    const localPaused = this.currentSong?.isPaused ?? false;
+    if (remotePaused !== localPaused) {
+      this.onRemotePlayback?.(remotePaused ? 'pause' : 'play');
     }
   }
 
