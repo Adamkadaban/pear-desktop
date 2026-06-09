@@ -54,6 +54,10 @@ class CastController {
   private onStateChanged?: (activeId: string | null) => void;
   private onSyncLocal?: (seconds: number) => void;
   private onRemotePlayback?: (action: 'play' | 'pause') => void;
+  // `@/providers/song-info` callbacks are additive with no unregister API, and
+  // this controller is a long-lived singleton, so we register exactly once even
+  // if the plugin is stopped and restarted within the same session.
+  private callbackRegistered = false;
 
   async start(
     config: ChromecastPluginConfig,
@@ -72,15 +76,18 @@ class CastController {
     await this.proxy.start(config.serverPort);
     this.discovery.start((devices) => this.onDevicesChanged?.(devices));
 
-    registerCallback((info, event) => {
-      const change: SongChange =
-        event === SongInfoEvent.VideoSrcChanged
-          ? 'src'
-          : event === SongInfoEvent.PlayOrPaused
-            ? 'play-or-paused'
-            : 'time';
-      this.onSongEvent(info, change).catch(console.error);
-    });
+    if (!this.callbackRegistered) {
+      this.callbackRegistered = true;
+      registerCallback((info, event) => {
+        const change: SongChange =
+          event === SongInfoEvent.VideoSrcChanged
+            ? 'src'
+            : event === SongInfoEvent.PlayOrPaused
+              ? 'play-or-paused'
+              : 'time';
+        this.onSongEvent(info, change).catch(console.error);
+      });
+    }
 
     if (config.autoConnect && config.lastDeviceId) {
       // Give discovery a moment to populate before reconnecting.

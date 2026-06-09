@@ -85,24 +85,23 @@ export class AudioProxy {
   async start(port: number) {
     this.port = port;
 
-    const [yti, honoMod, nodeServer, utilsMain, os, ytjs, nodeCrypto] =
+    const [yt, honoMod, nodeServer, utilsMain, os, nodeCrypto] =
       await Promise.all([
         import('\u0079\u006f\u0075\u0074\u0075\u0062\u0065i.js'),
         import('hono'),
         import('@hono/node-server'),
         import('@/plugins/utils/main'),
         import('node:os'),
-        import('\u0079\u006f\u0075\u0074\u0075\u0062\u0065i.js'),
         import('node:crypto'),
       ]);
 
     const upstreamFetch = utilsMain.getNetFetchAsFetch();
     this.lanIpAddr = computeLanIp(os.networkInterfaces());
-    this.yt = await yti.Innertube.create({
+    this.yt = await yt.Innertube.create({
       fetch: upstreamFetch,
       generate_session_locally: true,
     });
-    this.streamToIterable = ytjs.Utils.streamToIterable;
+    this.streamToIterable = yt.Utils.streamToIterable;
     this.randomName = () => nodeCrypto.randomBytes(16).toString('hex');
     this.token = nodeCrypto.randomBytes(16).toString('hex');
 
